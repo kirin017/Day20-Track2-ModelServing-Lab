@@ -1,0 +1,6 @@
+{
+  "tier": "Custom",
+  "repo_id": "manual",
+  "primary_model": "models/tinyllama-1.1b-chat-v0.3.Q4_K_S.gguf",
+  "compare_model": "models/tinyllama-1.1b-chat-v0.3.Q4_K_S.gguf"
+}

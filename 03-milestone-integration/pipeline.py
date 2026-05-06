@@ -1,123 +1,110 @@
-#!/usr/bin/env python3
-"""Skeleton RAG pipeline gluing N19 retrieval + N20 llama-server.
-
-Replace the STUB markers with your actual N18/N19 code. Runs as-is using
-in-memory toy data so you can confirm the OpenAI-compat call before wiring
-in your real lakehouse + vector store.
-"""
-from __future__ import annotations
-
 import time
-from dataclasses import dataclass
-from typing import Iterable
+import json
+import sys
+from pathlib import Path
+try:
+    from openai import OpenAI
+except ImportError:
+    print("ERROR: openai library not installed. Run 'pip install openai'")
+    sys.exit(1)
 
-import httpx
-
-LLAMA_SERVER_BASE = "http://localhost:8080/v1"
-SYSTEM_PROMPT = (
-    "You are a serving-engineering tutor. Answer using only the documents provided. "
-    "If the documents don't contain the answer, say so."
-)
-
-
-# ────────────────────────────────────────────────────────────────────────
-# Replace this STUB with retrieval against your N19 vector index.
-# ────────────────────────────────────────────────────────────────────────
-
-TOY_DOCS = [
-    {"id": "n20-paged", "text": "PagedAttention treats KV cache like virtual memory pages, eliminating 60-80% fragmentation."},
-    {"id": "n20-radix", "text": "RadixAttention stores KV in a prefix trie; cache hit on shared prefix lets the engine skip prefill."},
-    {"id": "n20-disagg", "text": "Disaggregated serving (Mooncake, llm-d, Dynamo) splits prefill and decode onto separate GPU pools."},
-    {"id": "n20-goodput", "text": "Goodput@SLO = req/s satisfying TTFT and TPOT SLOs. Throughput at saturation ignores SLO."},
-    {"id": "n20-quant", "text": "GGUF Q4_K_M is the production-quality default for laptop/edge serving via llama.cpp."},
+# --- Configuration ---
+LLAMA_SERVER_URL = "http://localhost:8080/v1"
+VECTOR_STORE_MOCK = [
+    {"id": 1, "text": "TTFT stands for Time To First Token. It measures the latency of the prefill stage.", "source": "Lesson 0"},
+    {"id": 2, "text": "TPOT stands for Time Per Output Token. It measures the latency of the decode stage.", "source": "Lesson 0"},
+    {"id": 3, "text": "Continuous batching allows new requests to join the batch while others are still generating.", "source": "Lesson 3"},
+    {"id": 4, "text": "Quantization reduces the precision of model weights to save RAM and increase speed.", "source": "Lesson 1"},
 ]
 
+client = OpenAI(base_url=LLAMA_SERVER_URL, api_key="sk-no-key-required")
 
-@dataclass
-class Doc:
-    id: str
-    text: str
-    score: float
+def retrieve(query: str, k: int = 2) -> list[dict]:
+    """
+    Mock retrieval function. In a real scenario, this would call 
+    a vector database like ChromaDB, Qdrant, or Pinecone (N19).
+    """
+    print(f"   [Retrieve] Searching for: '{query}'")
+    # Simple keyword match for demonstration
+    keywords = query.lower().split()
+    results = []
+    for doc in VECTOR_STORE_MOCK:
+        if any(kw in doc["text"].lower() for kw in keywords):
+            results.append(doc)
+    
+    # Return top-K (or all if matches are fewer)
+    return results[:k] if results else VECTOR_STORE_MOCK[:k]
 
-
-def retrieve(query: str, k: int = 3) -> list[Doc]:
-    """STUB: replace with your N19 vector index call."""
-    # Toy keyword overlap so the demo does *something* sensible without an embedder.
-    q_terms = {w.lower() for w in query.split() if len(w) > 3}
-    scored = [
-        Doc(d["id"], d["text"], score=len(q_terms & {w.lower() for w in d["text"].split()}))
-        for d in TOY_DOCS
-    ]
-    return sorted(scored, key=lambda d: d.score, reverse=True)[:k]
-
-
-# ────────────────────────────────────────────────────────────────────────
-# Prompt assembly
-# ────────────────────────────────────────────────────────────────────────
-
-
-def build_prompt(query: str, contexts: Iterable[Doc]) -> list[dict]:
-    ctx_block = "\n".join(f"[{c.id}] {c.text}" for c in contexts)
-    user = f"Context:\n{ctx_block}\n\nQuestion: {query}"
-    return [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": user},
-    ]
-
-
-# ────────────────────────────────────────────────────────────────────────
-# llama-server call
-# ────────────────────────────────────────────────────────────────────────
-
-
-def call_llm(messages: list[dict]) -> tuple[str, float]:
-    t0 = time.perf_counter()
-    r = httpx.post(
-        f"{LLAMA_SERVER_BASE}/chat/completions",
-        json={"model": "local", "messages": messages, "max_tokens": 200, "temperature": 0.3},
-        timeout=120.0,
+def build_prompt(query: str, contexts: list[dict]) -> list[dict]:
+    """
+    Constructs an OpenAI-style message list (System + Context + User).
+    """
+    context_text = "\n".join([f"- {c['text']} (Source: {c['source']})" for c in contexts])
+    
+    system_prompt = (
+        "You are a helpful AI assistant for the Model Serving Lab. "
+        "Use the provided context to answer the user's question accurately. "
+        "If the answer isn't in the context, say you don't know."
     )
-    r.raise_for_status()
-    elapsed_ms = (time.perf_counter() - t0) * 1000.0
-    return r.json()["choices"][0]["message"]["content"], elapsed_ms
-
-
-def answer(query: str) -> dict:
-    t_total = time.perf_counter()
-
-    t = time.perf_counter()
-    docs = retrieve(query, k=3)
-    t_retrieve_ms = (time.perf_counter() - t) * 1000.0
-
-    messages = build_prompt(query, docs)
-
-    text, t_llm_ms = call_llm(messages)
-
-    return {
-        "query": query,
-        "answer": text,
-        "contexts": [{"id": d.id, "score": d.score} for d in docs],
-        "timings_ms": {
-            "retrieve": round(t_retrieve_ms, 1),
-            "llm": round(t_llm_ms, 1),
-            "total": round((time.perf_counter() - t_total) * 1000.0, 1),
-        },
-    }
-
-
-def main() -> None:
-    queries = [
-        "Why is goodput more useful than throughput?",
-        "What problem does PagedAttention actually solve?",
-        "When should I think about disaggregated serving?",
+    
+    user_content = (
+        f"Context information is below:\n"
+        f"---------------------\n"
+        f"{context_text}\n"
+        f"---------------------\n"
+        f"Query: {query}\n"
+        f"Answer:"
+    )
+    
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content}
     ]
-    for q in queries:
-        print(f"\n=== {q} ===")
-        result = answer(q)
-        print(f"  contexts: {[c['id'] for c in result['contexts']]}")
-        print(f"  timings : {result['timings_ms']}")
-        print(f"  answer  : {result['answer'].strip()[:300]}")
 
+def answer(query: str) -> str:
+    """
+    Ties retrieval, prompt building, and LLM call together.
+    """
+    t0 = time.perf_counter()
+    
+    # 1. Retrieve
+    contexts = retrieve(query)
+    
+    # 2. Build Prompt
+    messages = build_prompt(query, contexts)
+    
+    # 3. Call LLM
+    print(f"   [LLM] Calling llama-server...")
+    try:
+        response = client.chat.completions.create(
+            model="local-model", # llama-server ignores this and uses the loaded model
+            messages=messages,
+            temperature=0.0, # Greedy for benchmark consistency
+            max_tokens=150
+        )
+        ans = response.choices[0].message.content
+    except Exception as e:
+        return f"Error calling server: {e}"
+    
+    t_total = (time.perf_counter() - t0) * 1000.0
+    print(f"   [Done] Total latency: {t_total:.1f}ms")
+    
+    print("\n--- Sources ---")
+    for c in contexts:
+        print(f" * {c['source']}: {c['text'][:50]}...")
+    
+    return ans
 
 if __name__ == "__main__":
-    main()
+    queries = [
+        "What is TTFT?",
+        "Explain quantization.",
+        "How does continuous batching work?"
+    ]
+    
+    print("=== Milestone 1 Integration Pipeline ===\n")
+    for q in queries:
+        print(f"\nQUERY: {q}")
+        result = answer(q)
+        print(f"\nANSWER:\n{result}")
+        print("-" * 50)
